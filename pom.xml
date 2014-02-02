@@ -85,6 +85,17 @@
         </test.jvm.argLine>
       </properties>
     </profile>
+    <profile>
+      <id>linux-native</id>
+      <activation>
+        <os>
+          <family>linux</family>
+        </os>
+      </activation>
+      <modules>
+        <module>transport-native-epoll</module>
+      </modules>
+    </profile>
   </profiles>
 
   <properties>
@@ -463,6 +474,11 @@
               <goal>manifest</goal>
             </goals>
             <configuration>
+              <supportedProjectTypes>
+                <supportedProjectType>jar</supportedProjectType>
+                <supportedProjectType>nar</supportedProjectType>
+                <supportedProjectType>bundle</supportedProjectType>
+              </supportedProjectTypes>
               <instructions>
                 <Export-Package>${project.groupId}.*</Export-Package>
                 <!-- enforce JVM vendor package as optional -->
