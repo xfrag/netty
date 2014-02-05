@@ -15,20 +15,34 @@
  */
 package io.netty.channel;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelFlushPromiseNotifier.FlushCheckpoint;
 import io.netty.util.concurrent.DefaultPromise;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GenericFutureListener;
 
+import java.nio.ByteBuffer;
+
 /**
  * The default {@link ChannelPromise} implementation.  It is recommended to use {@link Channel#newPromise()} to create
  * a new {@link ChannelPromise} rather than calling the constructor explicitly.
  */
-public class DefaultChannelPromise extends DefaultPromise<Void> implements ChannelPromise, FlushCheckpoint {
+public class DefaultChannelPromise extends DefaultPromise<Void>
+        implements ChannelPromise, FlushCheckpoint, ChannelOutboundBuffer.Entry {
 
     private final Channel channel;
     private long checkpoint;
+
+    // Fields for ChannelOutboundBuffer.Entry
+    private ChannelOutboundBuffer.Entry next;
+    private int count;
+    private ByteBuffer buffer;
+    private ByteBuffer[] buffers;
+    private int pendingSize;
+    private long total;
+    private long progress;
+    private Object msg;
 
     /**
      * Creates a new instance.
@@ -155,6 +169,89 @@ public class DefaultChannelPromise extends DefaultPromise<Void> implements Chann
     protected void checkDeadLock() {
         if (channel().isRegistered()) {
             super.checkDeadLock();
+        }
+    }
+
+    @Override
+    public int pendingSize() {
+        return pendingSize;
+    }
+
+    @Override
+    public long total() {
+        return total;
+    }
+
+    @Override
+    public long progress(long bytes) {
+        progress += bytes;
+        return progress;
+    }
+
+    @Override
+    public void clear() {
+        buffers = null;
+        buffer = null;
+        msg = null;
+        progress = 0;
+        total = 0;
+        pendingSize = 0;
+        count = 0;
+        next = null;
+    }
+
+    @Override
+    public void init(Object msg, int pendingSize, long total) {
+        this.msg = msg;
+        this.pendingSize = pendingSize;
+        this.total = total;
+        buffer = null;
+        buffers = null;
+        count = 0;
+    }
+
+    @Override
+    public void next(ChannelOutboundBuffer.Entry entry) {
+        next = entry;
+    }
+
+    @Override
+    public ChannelOutboundBuffer.Entry next() {
+        return next;
+    }
+
+    @Override
+    public ByteBuffer buffer() {
+        initBuffers();
+        return buffer;
+    }
+
+    @Override
+    public ByteBuffer[] buffers() {
+        initBuffers();
+        return buffers;
+    }
+
+    @Override
+    public int bufferCount() {
+        initBuffers();
+        return count;
+    }
+
+    @Override
+    public Object msg() {
+        return msg;
+    }
+
+    private void initBuffers() {
+        if (count == 0 && msg instanceof ByteBuf) {
+            ByteBuf buf = (ByteBuf) msg;
+            count = buf.nioBufferCount();
+            if (count == 1) {
+                buffer = buf.internalNioBuffer(buf.readerIndex(), buf.readableBytes());
+            } else {
+                buffers = buf.nioBuffers(buf.readerIndex(), buf.readableBytes());
+            }
         }
     }
 }

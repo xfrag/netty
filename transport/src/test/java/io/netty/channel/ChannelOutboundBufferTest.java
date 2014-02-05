@@ -31,7 +31,7 @@ public class ChannelOutboundBufferTest {
     @Test
     public void testEmptyNioBuffers() {
         TestChannel channel = new TestChannel();
-        ChannelOutboundBuffer buffer = ChannelOutboundBuffer.newInstance(channel);
+        ChannelOutboundBuffer buffer = new ChannelOutboundBuffer(channel);
         assertEquals(0, buffer.nioBufferCount());
         ByteBuffer[] buffers = buffer.nioBuffers();
         assertEquals(32, buffers.length);
@@ -46,7 +46,7 @@ public class ChannelOutboundBufferTest {
     public void testNioBuffersSingleBacked() {
         TestChannel channel = new TestChannel();
 
-        ChannelOutboundBuffer buffer = ChannelOutboundBuffer.newInstance(channel);
+        ChannelOutboundBuffer buffer = new ChannelOutboundBuffer(channel);
         assertEquals(0, buffer.nioBufferCount());
         ByteBuffer[] buffers = buffer.nioBuffers();
         assertEquals(32, buffers.length);
@@ -81,7 +81,7 @@ public class ChannelOutboundBufferTest {
     public void testNioBuffersExpand() {
         TestChannel channel = new TestChannel();
 
-        ChannelOutboundBuffer buffer = ChannelOutboundBuffer.newInstance(channel);
+        ChannelOutboundBuffer buffer = new ChannelOutboundBuffer(channel);
 
         ByteBuf buf = directBuffer().writeBytes("buf1".getBytes(CharsetUtil.US_ASCII));
         for (int i = 0; i < 64; i++) {
@@ -107,7 +107,7 @@ public class ChannelOutboundBufferTest {
     public void testNioBuffersExpand2() {
         TestChannel channel = new TestChannel();
 
-        ChannelOutboundBuffer buffer = ChannelOutboundBuffer.newInstance(channel);
+        ChannelOutboundBuffer buffer = new ChannelOutboundBuffer(channel);
 
         CompositeByteBuf comp = compositeBuffer(256);
         ByteBuf buf = directBuffer().writeBytes("buf1".getBytes(CharsetUtil.US_ASCII));

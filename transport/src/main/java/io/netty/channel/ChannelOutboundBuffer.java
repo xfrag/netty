@@ -31,7 +31,6 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
-import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
@@ -45,32 +44,11 @@ public final class ChannelOutboundBuffer {
 
     private static final int INITIAL_CAPACITY = 32;
 
-    private static final Recycler<ChannelOutboundBuffer> RECYCLER = new Recycler<ChannelOutboundBuffer>() {
-        @Override
-        protected ChannelOutboundBuffer newObject(Handle handle) {
-            return new ChannelOutboundBuffer(handle);
-        }
-    };
-
-    static ChannelOutboundBuffer newInstance(AbstractChannel channel) {
-        ChannelOutboundBuffer buffer = RECYCLER.get();
-        buffer.channel = channel;
-        buffer.totalPendingSize = 0;
-        buffer.writable = 1;
-        return buffer;
-    }
-
-    private final Handle handle;
-
-    private AbstractChannel channel;
-
-    // A circular buffer used to store messages.  The buffer is arranged such that:  flushed <= unflushed <= tail.  The
-    // flushed messages are stored in the range [flushed, unflushed).  Unflushed messages are stored in the range
-    // [unflushed, tail).
-    private Entry[] buffer;
+    private final AbstractChannel channel;
+    private Entry first;
+    private Entry last;
     private int flushed;
-    private int unflushed;
-    private int tail;
+    private int size;
 
     private ByteBuffer[] nioBuffers;
     private int nioBufferCount;
@@ -81,6 +59,7 @@ public final class ChannelOutboundBuffer {
     private static final AtomicLongFieldUpdater<ChannelOutboundBuffer> TOTAL_PENDING_SIZE_UPDATER =
             AtomicLongFieldUpdater.newUpdater(ChannelOutboundBuffer.class, "totalPendingSize");
 
+    @SuppressWarnings("unused")
     private volatile long totalPendingSize;
 
     private static final AtomicIntegerFieldUpdater<ChannelOutboundBuffer> WRITABLE_UPDATER =
@@ -88,66 +67,38 @@ public final class ChannelOutboundBuffer {
 
     private volatile int writable = 1;
 
-    private ChannelOutboundBuffer(Handle handle) {
-        this.handle = handle;
-
-        buffer = new Entry[INITIAL_CAPACITY];
-        for (int i = 0; i < buffer.length; i++) {
-            buffer[i] = new Entry();
-        }
-
-        nioBuffers = new ByteBuffer[INITIAL_CAPACITY];
+    ChannelOutboundBuffer(AbstractChannel channel) {
+        this.channel = channel;
     }
 
     void addMessage(Object msg, ChannelPromise promise) {
-        int size = channel.estimatorHandle().size(msg);
-        if (size < 0) {
-            size = 0;
+        int msgSize = channel.estimatorHandle().size(msg);
+        if (msgSize < 0) {
+            msgSize = 0;
         }
 
-        Entry e = buffer[tail++];
-        e.msg = msg;
-        e.pendingSize = size;
-        e.promise = promise;
-        e.total = total(msg);
-
-        tail &= buffer.length - 1;
-
-        if (tail == flushed) {
-            addCapacity();
+        Entry entry;
+        if (promise instanceof Entry) {
+            entry = (Entry) promise;
+        } else {
+            entry = RecyclableEntry.newInstance(promise);
         }
+        entry.init(msg, msgSize, total(msg));
 
+        if (last == null) {
+            first = last = entry;
+        } else {
+            last.next(entry);
+            last = entry;
+        }
+        size++;
         // increment pending bytes after adding message to the unflushed arrays.
         // See https://github.com/netty/netty/issues/1619
-        incrementPendingOutboundBytes(size);
-    }
-
-    private void addCapacity() {
-        int p = flushed;
-        int n = buffer.length;
-        int r = n - p; // number of elements to the right of p
-        int s = size();
-
-        int newCapacity = n << 1;
-        if (newCapacity < 0) {
-            throw new IllegalStateException();
-        }
-
-        Entry[] e = new Entry[newCapacity];
-        System.arraycopy(buffer, p, e, 0, r);
-        System.arraycopy(buffer, 0, e, r, p);
-        for (int i = n; i < e.length; i++) {
-            e[i] = new Entry();
-        }
-
-        buffer = e;
-        flushed = 0;
-        unflushed = s;
-        tail = n;
+        incrementPendingOutboundBytes(msgSize);
     }
 
     void addFlush() {
-        unflushed = tail;
+        flushed = size;
     }
 
     /**
@@ -223,7 +174,7 @@ public final class ChannelOutboundBuffer {
         if (isEmpty()) {
             return null;
         } else {
-            return buffer[flushed].msg;
+            return first.msg();
         }
     }
 
@@ -232,18 +183,17 @@ public final class ChannelOutboundBuffer {
      * The replaced msg will automatically be released
      */
     public void current(Object msg) {
-        Entry entry =  buffer[flushed];
-        safeRelease(entry.msg);
-        entry.msg = msg;
+        Entry entry =  first;
+        safeRelease(entry.msg());
+        entry.init(msg, entry.pendingSize(), entry.total());
     }
 
     public void progress(long amount) {
-        Entry e = buffer[flushed];
-        ChannelPromise p = e.promise;
+        Entry e = first;
+        ChannelPromise p = e.promise();
         if (p instanceof ChannelProgressivePromise) {
-            long progress = e.progress + amount;
-            e.progress = progress;
-            ((ChannelProgressivePromise) p).tryProgress(progress, e.total);
+            long progress = e.progress(amount);
+            ((ChannelProgressivePromise) p).tryProgress(progress, e.total());
         }
     }
 
@@ -252,23 +202,22 @@ public final class ChannelOutboundBuffer {
             return false;
         }
 
-        Entry e = buffer[flushed];
-        Object msg = e.msg;
-        if (msg == null) {
-            return false;
+        Entry e = first;
+        first = e.next();
+        if (first == null) {
+            last = null;
         }
 
-        ChannelPromise promise = e.promise;
-        int size = e.pendingSize;
+        ChannelPromise promise = e.promise();
+        int pendingSize = e.pendingSize();
+        flushed--;
+        size--;
 
+        safeRelease(e.msg());
         e.clear();
 
-        flushed = flushed + 1 & buffer.length - 1;
-
-        safeRelease(msg);
-
         promise.trySuccess();
-        decrementPendingOutboundBytes(size);
+        decrementPendingOutboundBytes(pendingSize);
 
         return true;
     }
@@ -278,23 +227,22 @@ public final class ChannelOutboundBuffer {
             return false;
         }
 
-        Entry e = buffer[flushed];
-        Object msg = e.msg;
-        if (msg == null) {
-            return false;
+        Entry e = first;
+        first = e.next();
+        if (first == null) {
+            last = null;
         }
+        ChannelPromise promise = e.promise();
+        int pendingSize = e.pendingSize();
 
-        ChannelPromise promise = e.promise;
-        int size = e.pendingSize;
+        flushed--;
+        size--;
 
+        safeRelease(e.msg());
         e.clear();
 
-        flushed = flushed + 1 & buffer.length - 1;
-
-        safeRelease(msg);
-
         safeFail(promise, cause);
-        decrementPendingOutboundBytes(size);
+        decrementPendingOutboundBytes(pendingSize);
 
         return true;
     }
@@ -313,48 +261,36 @@ public final class ChannelOutboundBuffer {
     public ByteBuffer[] nioBuffers() {
         long nioBufferSize = 0;
         int nioBufferCount = 0;
-        final int mask = buffer.length - 1;
         final ByteBufAllocator alloc = channel.alloc();
         ByteBuffer[] nioBuffers = this.nioBuffers;
-        Object m;
-        int i = flushed;
-        while (i != unflushed && (m = buffer[i].msg) != null) {
-            if (!(m instanceof ByteBuf)) {
+        if (nioBuffers == null) {
+            nioBuffers = this.nioBuffers = new ByteBuffer[INITIAL_CAPACITY];
+        }
+        Entry entry = first;
+        for (int i = 0; i < flushed; i++) {
+            if (!(entry.msg() instanceof ByteBuf)) {
                 this.nioBufferCount = 0;
                 this.nioBufferSize = 0;
                 return null;
             }
 
-            Entry entry = buffer[i];
-            ByteBuf buf = (ByteBuf) m;
+            ByteBuf buf = (ByteBuf) entry.msg();
             final int readerIndex = buf.readerIndex();
             final int readableBytes = buf.writerIndex() - readerIndex;
 
             if (readableBytes > 0) {
                 nioBufferSize += readableBytes;
-                int count = entry.count;
-                if (count == -1) {
-                    entry.count = count =  buf.nioBufferCount();
-                }
+                int count = entry.bufferCount();
                 int neededSpace = nioBufferCount + count;
                 if (neededSpace > nioBuffers.length) {
                     this.nioBuffers = nioBuffers = expandNioBufferArray(nioBuffers, neededSpace, nioBufferCount);
                 }
                 if (buf.isDirect() || !alloc.isDirectBufferPooled()) {
                     if (count == 1) {
-                        ByteBuffer nioBuf = entry.buf;
-                        if (nioBuf == null) {
-                            // cache ByteBuffer as it may need to create a new ByteBuffer instance if its a
-                            // derived buffer
-                            entry.buf = nioBuf = buf.internalNioBuffer(readerIndex, readableBytes);
-                        }
+                        ByteBuffer nioBuf = entry.buffer();
                         nioBuffers[nioBufferCount ++] = nioBuf;
                     } else {
-                        ByteBuffer[] nioBufs = entry.buffers;
-                        if (nioBufs == null) {
-                            // cached ByteBuffers as they may be expensive to create in terms of Object allocation
-                            entry.buffers = nioBufs = buf.nioBuffers();
-                        }
+                        ByteBuffer[] nioBufs = entry.buffers();
                         nioBufferCount = fillBufferArray(nioBufs, nioBuffers, nioBufferCount);
                     }
                 } else {
@@ -362,7 +298,7 @@ public final class ChannelOutboundBuffer {
                             readableBytes, alloc, nioBuffers, nioBufferCount);
                 }
             }
-            i = i + 1 & mask;
+            entry = entry.next();
         }
         this.nioBufferCount = nioBufferCount;
         this.nioBufferSize = nioBufferSize;
@@ -385,11 +321,8 @@ public final class ChannelOutboundBuffer {
         ByteBuf directBuf = alloc.directBuffer(readableBytes);
         directBuf.writeBytes(buf, readerIndex, readableBytes);
         buf.release();
-        entry.msg = directBuf;
-        // cache ByteBuffer
-        ByteBuffer nioBuf = entry.buf = directBuf.internalNioBuffer(0, readableBytes);
-        entry.count = 1;
-        nioBuffers[nioBufferCount ++] = nioBuf;
+        entry.init(directBuf, entry.pendingSize(), entry.total());
+        nioBuffers[nioBufferCount ++] = entry.buffer();
         return nioBufferCount;
     }
 
@@ -425,11 +358,11 @@ public final class ChannelOutboundBuffer {
     }
 
     public int size() {
-        return unflushed - flushed & buffer.length - 1;
+        return flushed;
     }
 
     public boolean isEmpty() {
-        return unflushed == flushed;
+        return size() == 0;
     }
 
     void failFlushed(Throwable cause) {
@@ -476,17 +409,23 @@ public final class ChannelOutboundBuffer {
         }
 
         // Release all unflushed messages.
-        final int unflushedCount = tail - unflushed & buffer.length - 1;
         try {
-            for (int i = 0; i < unflushedCount; i++) {
-                Entry e = buffer[unflushed + i & buffer.length - 1];
-                safeRelease(e.msg);
-                e.msg = null;
-                safeFail(e.promise, cause);
-                e.promise = null;
+            Entry e = first;
+            int flushed = this.flushed;
+            for (int i = 0;; i++) {
+                if (e == null) {
+                    break;
+                }
+                if (i <= flushed) {
+                    e = e.next();
+                    continue;
+                }
+
+                safeRelease(e.msg());
+                safeFail(e.promise(), cause);
 
                 // Just decrease; do not trigger any events via decrementPendingOutboundBytes()
-                int size = e.pendingSize;
+                int size = e.pendingSize();
                 long oldValue = totalPendingSize;
                 long newWriteBufferSize = oldValue - size;
                 while (!TOTAL_PENDING_SIZE_UPDATER.compareAndSet(this, oldValue, newWriteBufferSize)) {
@@ -494,14 +433,12 @@ public final class ChannelOutboundBuffer {
                     newWriteBufferSize = oldValue - size;
                 }
 
-                e.pendingSize = 0;
+                e.clear();
+                e = e.next();
             }
         } finally {
-            tail = unflushed;
             inFail = false;
         }
-
-        recycle();
     }
 
     private static void safeRelease(Object message) {
@@ -518,57 +455,145 @@ public final class ChannelOutboundBuffer {
         }
     }
 
-    public void recycle() {
-        if (buffer.length > INITIAL_CAPACITY) {
-            Entry[] e = new Entry[INITIAL_CAPACITY];
-            System.arraycopy(buffer, 0, e, 0, INITIAL_CAPACITY);
-            buffer = e;
-        }
-
-        if (nioBuffers.length > INITIAL_CAPACITY) {
-            nioBuffers = new ByteBuffer[INITIAL_CAPACITY];
-        } else {
-            // null out the nio buffers array so the can be GC'ed
-            // https://github.com/netty/netty/issues/1763
-            Arrays.fill(nioBuffers, null);
-        }
-
-        // reset flushed, unflushed and tail
-        // See https://github.com/netty/netty/issues/1772
-        flushed = 0;
-        unflushed = 0;
-        tail = 0;
-
-        // Set the channel to null so it can be GC'ed ASAP
-        channel = null;
-
-        RECYCLER.recycle(this, handle);
-    }
-
     public long totalPendingWriteBytes() {
-        return this.totalPendingSize;
+        return totalPendingSize;
     }
 
-    private static final class Entry {
-        Object msg;
-        ByteBuffer[] buffers;
-        ByteBuffer buf;
-        ChannelPromise promise;
-        long progress;
-        long total;
-        int pendingSize;
-        int count = -1;
+    private static final class RecyclableEntry implements Entry {
+        private static final Recycler<RecyclableEntry> RECYCLER = new Recycler<RecyclableEntry>() {
+            @Override
+            protected RecyclableEntry newObject(Handle handle) {
+                return new RecyclableEntry(handle);
+            }
+        };
 
+        private final Handle handle;
+        private ChannelPromise promise;
+        private Entry next;
+        private int count;
+        private ByteBuffer buffer;
+        private ByteBuffer[] buffers;
+        private int pendingSize;
+        private long total;
+        private long progress;
+        private Object msg;
+
+        static Entry newInstance(ChannelPromise promise) {
+            RecyclableEntry entry = RECYCLER.get();
+            entry.promise = promise;
+            return entry;
+        }
+
+        private RecyclableEntry(Handle handle) {
+            this.handle = handle;
+        }
+
+        @Override
+        public int pendingSize() {
+            return pendingSize;
+        }
+
+        @Override
+        public long total() {
+            return total;
+        }
+
+        @Override
+        public long progress(long bytes) {
+            progress += bytes;
+            return progress;
+        }
+
+        @Override
         public void clear() {
             buffers = null;
-            buf = null;
+            buffer = null;
             msg = null;
             promise = null;
             progress = 0;
             total = 0;
             pendingSize = 0;
-            count = -1;
+            count = 0;
+            next = null;
+            RECYCLER.recycle(this, handle);
+        }
+
+        @Override
+        public void init(Object msg, int pendingSize, long total) {
+            this.msg = msg;
+            this.pendingSize = pendingSize;
+            this.total = total;
+            buffer = null;
+            buffers = null;
+            count = 0;
+        }
+
+        @Override
+        public void next(Entry entry) {
+            next = entry;
+        }
+
+        @Override
+        public Entry next() {
+            return next;
+        }
+
+        @Override
+        public ChannelPromise promise() {
+            return promise;
+        }
+
+        @Override
+        public ByteBuffer buffer() {
+            initBuffers();
+            return buffer;
+        }
+
+        @Override
+        public ByteBuffer[] buffers() {
+            initBuffers();
+            return buffers;
+        }
+
+        @Override
+        public int bufferCount() {
+            initBuffers();
+            return count;
+        }
+
+        @Override
+        public Object msg() {
+            return msg;
+        }
+
+        private void initBuffers() {
+            if (count == 0 && msg instanceof ByteBuf) {
+                ByteBuf buf = (ByteBuf) msg;
+                count = buf.nioBufferCount();
+                if (count == 1) {
+                    buffer = buf.internalNioBuffer(buf.readerIndex(), buf.readableBytes());
+                } else {
+                    buffers = buf.nioBuffers(buf.readerIndex(), buf.readableBytes());
+                }
+            }
         }
     }
 
+    /**
+     * Entry in this {@link ChannelOutboundBuffer} which maps a message to a {@link ChannelPromise}
+     */
+    interface Entry {
+        void init(Object msg, int pendingSize, long total);
+        void next(Entry entry);
+        int pendingSize();
+        long total();
+        long progress(long progress);
+        Entry next();
+        ChannelPromise promise();
+        ByteBuffer buffer();
+        ByteBuffer[] buffers();
+        int bufferCount();
+        Object msg();
+        void clear();
+    }
 }
