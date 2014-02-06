@@ -51,8 +51,8 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
     private final EventExecutor executor;
 
     private volatile Object result;
-    private Object listeners; // Can be ChannelFutureListener or DefaultFutureListeners
-
+    private volatile  Object listeners; // Can be GenericFutureListener or DefaultFutureListeners
+    private volatile boolean notificationComplete; // Will be set to true once all GenericFutureListeners were notified
     private short waiters;
 
     /**
@@ -125,9 +125,8 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
         if (listener == null) {
             throw new NullPointerException("listener");
         }
-
         if (isDone()) {
-            notifyListener(executor(), this, listener);
+            notifyListener(executor(), this, listener, !notificationComplete);
             return this;
         }
 
@@ -149,7 +148,7 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
             }
         }
 
-        notifyListener(executor(), this, listener);
+        notifyListener(executor(), this, listener, !notificationComplete);
         return this;
     }
 
@@ -385,9 +384,8 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
     }
 
     @Override
-    public Promise<V> setSuccess(V result) {
+    public synchronized Promise<V> setSuccess(V result) {
         if (setSuccess0(result)) {
-            notifyListeners();
             return this;
         }
         throw new IllegalStateException("complete already: " + this);
@@ -396,7 +394,6 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
     @Override
     public boolean trySuccess(V result) {
         if (setSuccess0(result)) {
-            notifyListeners();
             return true;
         }
         return false;
@@ -405,7 +402,6 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
     @Override
     public Promise<V> setFailure(Throwable cause) {
         if (setFailure0(cause)) {
-            notifyListeners();
             return this;
         }
         throw new IllegalStateException("complete already: " + this, cause);
@@ -414,7 +410,6 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
     @Override
     public boolean tryFailure(Throwable cause) {
         if (setFailure0(cause)) {
-            notifyListeners();
             return true;
         }
         return false;
@@ -427,6 +422,7 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
             return false;
         }
 
+        Object listeners;
         synchronized (this) {
             // Allow only once.
             result = this.result;
@@ -438,9 +434,22 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
             if (hasWaiters()) {
                 notifyAll();
             }
-        }
+            listeners = this.listeners;
+            if (listeners == null) {
+                return true;
+            }
+            this.listeners = null;
 
-        notifyListeners();
+            EventExecutor executor = executor();
+            if (!executor.inEventLoop()) {
+                // If we are not in the eventloop here we need to make sure that notifyListeners is called within
+                // the synchronized block to eliminate a race against addListener(...) when it is also called
+                // from outside the eventloop.
+                notifyListeners(listeners);
+                return true;
+            }
+        }
+        scheduleNotifyListeners(listeners);
         return true;
     }
 
@@ -468,6 +477,7 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
             return false;
         }
 
+        Object listeners;
         synchronized (this) {
             // Allow only once.
             if (isDone()) {
@@ -478,7 +488,22 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
             if (hasWaiters()) {
                 notifyAll();
             }
+            listeners = this.listeners;
+            if (listeners == null) {
+                return true;
+            }
+
+            this.listeners = null;
+            EventExecutor executor = executor();
+            if (!executor.inEventLoop()) {
+                // If we are not in the eventloop here we need to make sure that notifyListeners is called within
+                // the synchronized block to eliminate a race against addListener(...) when it is also called
+                // from outside the eventloop.
+                notifyListeners(listeners);
+                return true;
+            }
         }
+        scheduleNotifyListeners(listeners);
         return true;
     }
 
@@ -487,6 +512,7 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
             return false;
         }
 
+        Object listeners;
         synchronized (this) {
             // Allow only once.
             if (isDone()) {
@@ -500,7 +526,22 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
             if (hasWaiters()) {
                 notifyAll();
             }
+            listeners = this.listeners;
+            if (listeners == null) {
+                return true;
+            }
+            this.listeners = null;
+
+            EventExecutor executor = executor();
+            if (!executor.inEventLoop()) {
+                // If we are not in the eventloop here we need to make sure that notifyListeners is called within
+                // the synchronized block to eliminate a race against addListener(...) when it is also called
+                // from outside the eventloop.
+                notifyListeners(listeners);
+                return true;
+            }
         }
+        scheduleNotifyListeners(listeners);
         return true;
     }
 
@@ -529,41 +570,28 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
         waiters --;
     }
 
-    private void notifyListeners() {
-        // This method doesn't need synchronization because:
-        // 1) This method is always called after synchronized (this) block.
-        //    Hence any listener list modification happens-before this method.
-        // 2) This method is called only when 'done' is true.  Once 'done'
-        //    becomes true, the listener list is never modified - see add/removeListener()
-
-        Object listeners = this.listeners;
-        if (listeners == null) {
-            return;
-        }
-
-        this.listeners = null;
-
-        EventExecutor executor = executor();
-        if (executor.inEventLoop()) {
-            final Integer stackDepth = LISTENER_STACK_DEPTH.get();
-            if (stackDepth < MAX_LISTENER_STACK_DEPTH) {
-                LISTENER_STACK_DEPTH.set(stackDepth + 1);
-                try {
-                    if (listeners instanceof DefaultFutureListeners) {
-                        notifyListeners0(this, (DefaultFutureListeners) listeners);
-                    } else {
-                        @SuppressWarnings("unchecked")
-                        final GenericFutureListener<? extends Future<V>> l =
-                                (GenericFutureListener<? extends Future<V>>) listeners;
-                        notifyListener0(this, l);
-                    }
-                } finally {
-                    LISTENER_STACK_DEPTH.set(stackDepth);
+    private void notifyListeners(Object listeners) {
+        final Integer stackDepth = LISTENER_STACK_DEPTH.get();
+        if (stackDepth < MAX_LISTENER_STACK_DEPTH) {
+            LISTENER_STACK_DEPTH.set(stackDepth + 1);
+            try {
+                if (listeners instanceof DefaultFutureListeners) {
+                    notifyListeners0(this, (DefaultFutureListeners) listeners);
+                } else {
+                    @SuppressWarnings("unchecked")
+                    final GenericFutureListener<? extends Future<V>> l =
+                            (GenericFutureListener<? extends Future<V>>) listeners;
+                    notifyListener0(this, l);
                 }
-                return;
+            } finally {
+                LISTENER_STACK_DEPTH.set(stackDepth);
+                notificationComplete = true;
             }
         }
+    }
 
+    private void scheduleNotifyListeners(Object listeners) {
+        EventExecutor executor = executor();
         try {
             if (listeners instanceof DefaultFutureListeners) {
                 final DefaultFutureListeners dfl = (DefaultFutureListeners) listeners;
@@ -571,6 +599,7 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
                     @Override
                     public void run() {
                         notifyListeners0(DefaultPromise.this, dfl);
+                        notificationComplete = true;
                     }
                 });
             } else {
@@ -581,6 +610,7 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
                     @Override
                     public void run() {
                         notifyListener0(DefaultPromise.this, l);
+                        notificationComplete = true;
                     }
                 });
             }
@@ -598,9 +628,16 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
     }
 
     protected static void notifyListener(
-            final EventExecutor eventExecutor, final Future<?> future, final GenericFutureListener<?> l) {
+            final EventExecutor eventExecutor, final Future<?> future,
+            final GenericFutureListener<?> l) {
+        notifyListener(eventExecutor, future, l, false);
+    }
 
-        if (eventExecutor.inEventLoop()) {
+    protected static void notifyListener(
+            final EventExecutor eventExecutor, final Future<?> future,
+            final GenericFutureListener<?> l, final boolean schedule) {
+
+        if (!schedule && eventExecutor.inEventLoop()) {
             final Integer stackDepth = LISTENER_STACK_DEPTH.get();
             if (stackDepth < MAX_LISTENER_STACK_DEPTH) {
                 LISTENER_STACK_DEPTH.set(stackDepth + 1);
